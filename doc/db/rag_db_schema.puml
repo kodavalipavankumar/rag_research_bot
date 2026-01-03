@@ -1,0 +1,430 @@
+@startuml
+' =========================
+' RAG Database ER Diagram (Postgres + pgvector) — Source-of-Truth (Non-Redundant)
+' Render in VS Code PlantUML extension (Alt+D)
+' =========================
+hide circle
+skinparam linetype ortho
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+' ---------- Packages ----------
+package "Tenancy & Identity" {
+  entity tenants {
+    *tenant_id : uuid <<PK>>
+    --
+    tenant_name : text <<UQ>>
+    created_at : timestamptz
+  }
+
+  entity principals {
+    *principal_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    ptype : principal_type
+    email : citext
+    display_name : text
+    is_active : boolean
+    created_at : timestamptz
+  }
+
+  entity principal_membership {
+    *tenant_id : uuid <<PK,FK>>
+    *group_id : uuid <<PK,FK>>
+    *member_id : uuid <<PK,FK>>
+    --
+    created_at : timestamptz
+  }
+}
+
+package "External Metadata & Artifacts (Source of Truth)" {
+
+  entity external_sources {
+    *source_system : text <<PK>>
+    --
+    description : text
+    base_url : text
+    created_at : timestamptz
+  }
+
+  ' External paper truth (as ingested from arXiv/PMC/OpenAlex/etc.)
+  entity external_records {
+    *record_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    source_system : text <<FK>>          ' arxiv / pmc / openalex / s2orc
+    external_id : text                   ' 2512.01234 (source-native)
+    external_version : text              ' v1/v2 or null if not versioned
+    title : text
+    abstract : text
+    authors_json : jsonb
+    published_at : timestamptz
+    updated_at : timestamptz
+    primary_url : text                   ' landing page
+    pdf_url : text
+    license : text
+    extra : jsonb
+    created_at : timestamptz
+    UNIQUE (tenant_id, source_system, external_id, external_version)
+  }
+
+  ' Link external record(s) to an internal document
+  entity document_external_links {
+    *tenant_id : uuid <<PK,FK>>
+    *doc_id : uuid <<PK,FK>>
+    *record_id : uuid <<PK,FK>>
+    --
+    is_primary : boolean
+    created_at : timestamptz
+  }
+
+  ' Normalized identifiers (single source of truth for DOI/PMID/PMCID/arXiv/OpenAlex/etc.)
+  entity document_identifiers {
+    *tenant_id : uuid <<PK,FK>>
+    *doc_id : uuid <<PK,FK>>
+    *id_type : text <<PK>>               ' DOI / ARXIV / PMID / PMCID / OPENALEX / etc.
+    *id_value : text <<PK>>
+    --
+    created_at : timestamptz
+  }
+
+  ' Physical files (single source of truth for paths/hashes/sizes/mime)
+  entity document_artifacts {
+    *artifact_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    doc_version_id : uuid <<FK>>
+    artifact_type : text                 ' RAW_PDF / OCR_PDF / SOURCE_TAR / METADATA_JSON / EXTRACTED_TEXT / etc.
+    storage_kind : text                  ' LOCAL_DISK (future: GCS/S3)
+    local_path : text
+    uri : text                           ' optional: file:// or http(s) fallback
+    mime_type : text
+    file_size_bytes : bigint
+    content_hash : text                  ' sha256
+    created_at : timestamptz
+  }
+
+  ' Batch/provenance reporting only (execution lives in ingestion_jobs)
+  entity ingestion_runs {
+    *run_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    source_system : text <<FK>>
+    stage : text                         ' DISCOVER / DOWNLOAD / EXTRACT / CLEAN / EMBED
+    status : job_status
+    config : jsonb
+    stats : jsonb
+    started_at : timestamptz
+    finished_at : timestamptz
+    created_at : timestamptz
+  }
+
+  ' Queryable, indexed metadata (only for keys you filter/sort on)
+  entity document_kv_metadata {
+    *tenant_id : uuid <<PK,FK>>
+    *doc_id : uuid <<PK,FK>>
+    *mkey : text <<PK>>
+    --
+    mvalue_text : text
+    mvalue_num : numeric
+    mvalue_bool : boolean
+    mvalue_json : jsonb
+    source : text                        ' extracted / user / external
+    created_at : timestamptz
+  }
+}
+
+package "Documents & Extraction (Internal Truth)" {
+  ' Internal document concept (no external_id/source_system duplication)
+  entity documents {
+    *doc_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    title : text                         ' internal display title (optional override)
+    tags : text[]
+    metadata : jsonb                     ' unindexed/rare/nested metadata
+    created_by : uuid <<FK>>
+    created_at : timestamptz
+    updated_at : timestamptz
+  }
+
+  ' Logical versioning + pipeline state only (no file duplicates)
+  entity document_versions {
+    *doc_version_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    doc_id : uuid <<FK>>
+    version_num : int
+    status : doc_status
+    error_message : text
+    created_at : timestamptz
+  }
+
+  entity content_parts {
+    *part_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    doc_version_id : uuid <<FK>>
+    ptype : content_part_type
+    part_index : int
+    text : text
+    page_num : int
+    bbox : jsonb
+    extra : jsonb
+    created_at : timestamptz
+  }
+
+  entity chunks {
+    *chunk_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    doc_version_id : uuid <<FK>>
+    part_id : uuid <<FK>>
+    chunk_index : int
+    text : text
+    tsv: tsvector
+    token_count : int
+    char_count : int
+    page_start : int
+    page_end : int
+    citation : jsonb
+    metadata : jsonb
+    created_at : timestamptz
+  }
+}
+
+package "Embeddings & Vector Search" {
+  entity embedding_models {
+    *embed_model_id : uuid <<PK>>
+    --
+    provider : text
+    model_name : text
+    dims : int
+    distance : text
+    params : jsonb
+    created_at : timestamptz
+  }
+
+  entity chunk_embeddings {
+    *tenant_id : uuid <<PK,FK>>
+    *chunk_id : uuid <<PK,FK>>
+    *embed_model_id : uuid <<PK,FK>>
+    *embed_version : int <<PK>>
+    --
+    embedding : vector(dims)
+    created_at : timestamptz
+  }
+}
+
+package "Collections (optional)" {
+  entity collections {
+    *collection_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    name : text
+    description : text
+    metadata : jsonb
+    created_at : timestamptz
+  }
+
+  entity collection_documents {
+    *tenant_id : uuid <<PK,FK>>
+    *collection_id : uuid <<PK,FK>>
+    *doc_id : uuid <<PK,FK>>
+    --
+    created_at : timestamptz
+  }
+}
+
+package "Security (ACL)" {
+  entity acl_bindings {
+    *tenant_id : uuid <<PK,FK>>
+    *object_type : acl_object_type <<PK>>
+    *object_id : uuid <<PK>>
+    *principal_id : uuid <<PK,FK>>
+    *permission : acl_permission <<PK>>
+    --
+    created_at : timestamptz
+  }
+}
+
+package "Chat & Memory" {
+  entity conversations {
+    *conversation_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    owner_principal_id : uuid <<FK>>
+    title : text
+    metadata : jsonb
+    created_at : timestamptz
+    updated_at : timestamptz
+  }
+
+  entity chat_messages {
+    *message_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    conversation_id : uuid <<FK>>
+    author_principal_id : uuid <<FK>>
+    role : chat_role
+    content : text
+    tool_payload : jsonb
+    citations : jsonb
+    metadata : jsonb
+    created_at : timestamptz
+  }
+
+  entity memory_items {
+    *memory_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    conversation_id : uuid <<FK>>
+    created_by_principal_id : uuid <<FK>>
+    mtype : memory_type
+    title : text
+    content : text
+    tags : text[]
+    importance : real
+    valid_from : timestamptz
+    valid_to : timestamptz
+    metadata : jsonb
+    created_at : timestamptz
+    updated_at : timestamptz
+  }
+
+  entity memory_embeddings {
+    *tenant_id : uuid <<PK,FK>>
+    *memory_id : uuid <<PK,FK>>
+    *embed_model_id : uuid <<PK,FK>>
+    *embed_version : int <<PK>>
+    --
+    embedding : vector(dims)
+    created_at : timestamptz
+  }
+}
+
+package "Ops, Logging, Self-Improving (Execution Source of Truth)" {
+  ' Single execution/queue system (locks/retries/live state)
+  entity ingestion_jobs {
+    *job_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    doc_version_id : uuid <<FK>>
+    run_id : uuid <<FK>>                 ' optional: links to ingestion_runs for provenance
+    stage : text                         ' DOWNLOAD / EXTRACT / CLEAN / EMBED
+    status : job_status
+    attempts : int
+    locked_by : text
+    locked_at : timestamptz
+    error_message : text
+    created_at : timestamptz
+    updated_at : timestamptz
+  }
+
+  entity rag_queries {
+    *query_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    principal_id : uuid <<FK>>
+    conversation_id : uuid <<FK>>
+    query_text : text
+    rewritten_query : text
+    mode : text
+    latency_ms : int
+    model_name : text
+    extra : jsonb
+    created_at : timestamptz
+  }
+
+  entity rag_retrievals {
+    *query_id : uuid <<PK,FK>>
+    *tenant_id : uuid <<PK,FK>>
+    *stage : text <<PK>>
+    *rank : int <<PK>>
+    --
+    source_type : text
+    source_id : uuid
+    score : float
+  }
+
+  entity rag_feedback {
+    *feedback_id : uuid <<PK>>
+    --
+    tenant_id : uuid <<FK>>
+    query_id : uuid <<FK>>
+    principal_id : uuid <<FK>>
+    rating : int
+    reason : text
+    extra : jsonb
+    created_at : timestamptz
+  }
+}
+
+' ---------- Relationships ----------
+tenants ||--o{ principals : has
+principals ||--o{ principal_membership : member
+principals ||--o{ principal_membership : group
+
+' ---------- External metadata ----------
+external_sources ||--o{ external_records : provides
+tenants ||--o{ external_records : owns
+
+documents ||--o{ document_external_links : linked_to
+external_records ||--o{ document_external_links : references
+tenants ||--o{ document_external_links : has
+
+documents ||--o{ document_identifiers : identifies
+tenants ||--o{ document_identifiers : has
+
+documents ||--o{ document_kv_metadata : has
+tenants ||--o{ document_kv_metadata : owns
+
+' ---------- Internal docs/extraction ----------
+tenants ||--o{ documents : owns
+principals ||--o{ documents : created_by
+documents ||--o{ document_versions : versions
+document_versions ||--o{ content_parts : extracted_into
+content_parts ||--o{ chunks : sourced_from
+document_versions ||--o{ chunks : chunked_into
+
+' ---------- Physical artifacts ----------
+document_versions ||--o{ document_artifacts : stores
+tenants ||--o{ document_artifacts : owns
+
+' ---------- Embeddings ----------
+embedding_models ||--o{ chunk_embeddings : used_by
+chunks ||--o{ chunk_embeddings : has
+
+' ---------- Collections ----------
+tenants ||--o{ collections : has
+collections ||--o{ collection_documents : contains
+documents ||--o{ collection_documents : in
+
+' ---------- Chat & memory ----------
+tenants ||--o{ conversations : has
+principals ||--o{ conversations : owns
+conversations ||--o{ chat_messages : contains
+
+conversations ||--o{ memory_items : accumulates
+memory_items ||--o{ memory_embeddings : vectorized
+embedding_models ||--o{ memory_embeddings : used_by
+
+' ---------- Ops ----------
+tenants ||--o{ ingestion_runs : executes
+external_sources ||--o{ ingestion_runs : source_for
+
+tenants ||--o{ ingestion_jobs : runs
+document_versions ||--o{ ingestion_jobs : processed_by
+ingestion_runs ||--o{ ingestion_jobs : groups
+
+tenants ||--o{ rag_queries : logs
+principals ||--o{ rag_queries : asked_by
+conversations ||--o{ rag_queries : context_for
+rag_queries ||--o{ rag_retrievals : produced
+rag_queries ||--o{ rag_feedback : receives
+
+' ---------- ACL ----------
+tenants ||--o{ acl_bindings : defines
+principals ||--o{ acl_bindings : granted_to
+
+@enduml
